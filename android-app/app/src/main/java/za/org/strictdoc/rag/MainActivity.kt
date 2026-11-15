@@ -1,19 +1,20 @@
 package za.org.strictdoc.rag
 
 import android.app.AlertDialog
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.text.SpannableStringBuilder
-import android.text.Spanned
-import android.text.style.ForegroundColorSpan
 import android.view.View
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import androidx.work.*
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -21,6 +22,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import za.org.strictdoc.rag.data.AppDatabase
 import za.org.strictdoc.rag.data.DocumentRecord
@@ -32,21 +34,20 @@ import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var tvCorpusStatus: TextView
-    private lateinit var tvStatusBadge: TextView
-    private lateinit var tvAnswerOutput: TextView
+    private lateinit var pillVaultStatus: TextView
+    private lateinit var rvChat: RecyclerView
+    private lateinit var tvEmptyHint: View
     private lateinit var etQuery: EditText
-    private lateinit var btnApproveExternal: Button
-    private lateinit var btnSaveAnswer: Button
+    private lateinit var chatAdapter: ChatAdapter
 
-    private var lastQuery: String = ""
-    private var lastStatus: String = ""
-    private var lastUsedExternal: Boolean = false
-    private var lastFormattedText: String = ""
+    private val turns = mutableListOf<ChatTurn>()
+    private val selectedDocIds = mutableSetOf<String>()
+    private var queryAllDocs = true
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .connectTimeout(45, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private val docPicker = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -57,37 +58,254 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        tvCorpusStatus = findViewById(R.id.tvCorpusStatus)
-        tvStatusBadge = findViewById(R.id.tvStatusBadge)
-        tvAnswerOutput = findViewById(R.id.tvAnswerOutput)
+        pillVaultStatus = findViewById(R.id.pillVaultStatus)
+        rvChat = findViewById(R.id.rvChat)
+        tvEmptyHint = findViewById(R.id.tvEmptyHint)
         etQuery = findViewById(R.id.etQuery)
-        btnApproveExternal = findViewById(R.id.btnApproveExternal)
-        btnSaveAnswer = findViewById(R.id.btnSaveAnswer)
+
+        chatAdapter = ChatAdapter(
+            items = turns,
+            onCitationClick = { showCitationSheet(it) },
+            onWebLinkClick = { url ->
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (_: Exception) {
+                    Toast.makeText(this, "Cannot open link", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onApproveExternal = { turn -> runQueryTurn(turn.query, allowExternal = true, existingTurn = turn) },
+            onSaveTurn = { saveTurnOffline(it) }
+        )
+
+        rvChat.layoutManager = LinearLayoutManager(this)
+        rvChat.adapter = chatAdapter
 
         findViewById<Button>(R.id.btnSettings).setOnClickListener { showGatewayUrlDialog() }
         findViewById<Button>(R.id.btnSaved).setOnClickListener { showSavedAnswersDialog() }
-        findViewById<Button>(R.id.btnUploadDoc).setOnClickListener {
-            docPicker.launch(arrayOf("application/pdf", "text/plain", "text/markdown"))
-        }
-        findViewById<Button>(R.id.btnRefreshDocs).setOnClickListener {
-            enqueueSyncWorker()
-            refreshCorpusStatus()
-        }
-        findViewById<Button>(R.id.btnAsk).setOnClickListener {
+        pillVaultStatus.setOnClickListener { showVaultBottomSheet() }
+        findViewById<Button>(R.id.btnVaultAttach).setOnClickListener { showVaultBottomSheet() }
+
+        findViewById<Button>(R.id.btnSend).setOnClickListener {
             val q = etQuery.text.toString().trim()
             if (q.isNotEmpty()) {
-                // Automatic safety reset to Strict Mode on every new question
-                executeQuery(q, allowExternal = false)
+                etQuery.setText("")
+                // Automatic safety reset: every new question starts strictly in Docs-Only mode
+                runQueryTurn(q, allowExternal = false, existingTurn = null)
             }
         }
-        btnApproveExternal.setOnClickListener {
-            if (lastQuery.isNotEmpty()) {
-                executeQuery(lastQuery, allowExternal = true)
-            }
-        }
-        btnSaveAnswer.setOnClickListener { saveCurrentAnswerOffline() }
 
-        refreshCorpusStatus()
+        refreshVaultPill()
+    }
+
+    private fun refreshVaultPill() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val docs = AppDatabase.getDatabase(this@MainActivity).documentDao().getAllDocuments()
+            val synced = docs.count { it.syncState == "SYNCED" }
+            val queued = docs.count { it.syncState == "QUEUED" }
+            withContext(Dispatchers.Main) {
+                val scopeTag = if (queryAllDocs || selectedDocIds.isEmpty()) "All" else "${selectedDocIds.size} selected"
+                pillVaultStatus.text = when {
+                    synced > 0 && queued == 0 -> "Vault: $synced ready ($scopeTag)"
+                    synced > 0 && queued > 0 -> "Vault: $synced ready • $queued queued"
+                    queued > 0 -> "Vault: $queued queued • Tap to sync"
+                    else -> "Vault: Empty • Tap to add PDFs"
+                }
+                pillVaultStatus.setTextColor(Color.parseColor(if (synced > 0) "#34D399" else "#FBBF24"))
+            }
+        }
+    }
+
+    private fun showVaultBottomSheet() {
+        val sheet = BottomSheetDialog(this)
+        val view = layoutInflater.inflate(R.layout.sheet_vault, null)
+        sheet.setContentView(view)
+
+        val btnAdd = view.findViewById<Button>(R.id.btnVaultAdd)
+        val btnSync = view.findViewById<Button>(R.id.btnVaultSync)
+        val cbAll = view.findViewById<CheckBox>(R.id.cbSelectAll)
+        val rvDocs = view.findViewById<RecyclerView>(R.id.rvVaultDocs)
+
+        rvDocs.layoutManager = LinearLayoutManager(this)
+        cbAll.isChecked = queryAllDocs
+
+        fun reloadSheetList() {
+            lifecycleScope.launch(Dispatchers.IO) {
+                val docs = AppDatabase.getDatabase(this@MainActivity).documentDao().getAllDocuments()
+                withContext(Dispatchers.Main) {
+                    rvDocs.adapter = VaultAdapter(
+                        docs = docs,
+                        selectedRemoteIds = selectedDocIds,
+                        selectAllMode = { queryAllDocs },
+                        onToggleChanged = {
+                            queryAllDocs = false
+                            cbAll.isChecked = false
+                            refreshVaultPill()
+                        }
+                    )
+                }
+            }
+        }
+
+        cbAll.setOnCheckedChangeListener { _, checked ->
+            queryAllDocs = checked
+            if (checked) selectedDocIds.clear()
+            reloadSheetList()
+            refreshVaultPill()
+        }
+
+        btnAdd.setOnClickListener {
+            sheet.dismiss()
+            docPicker.launch(arrayOf("application/pdf", "text/plain", "text/markdown"))
+        }
+
+        btnSync.setOnClickListener {
+            val baseUrl = getSharedPreferences("rag_prefs", MODE_PRIVATE).getString("gateway_url", "") ?: ""
+            if (baseUrl.isEmpty()) {
+                sheet.dismiss()
+                showGatewayUrlDialog()
+            } else {
+                enqueueSyncWorker()
+                Toast.makeText(this, "Syncing documents to cloud...", Toast.LENGTH_SHORT).show()
+                rvDocs.postDelayed({ reloadSheetList(); refreshVaultPill() }, 2500)
+            }
+        }
+
+        reloadSheetList()
+        sheet.show()
+    }
+
+    private fun showCitationSheet(src: CitationSourceItem) {
+        val sheet = BottomSheetDialog(this)
+        val view = layoutInflater.inflate(R.layout.sheet_citation, null)
+        view.findViewById<TextView>(R.id.tvCiteTitle).text = src.filename
+        view.findViewById<TextView>(R.id.tvCiteMeta).text = "Page ${src.pageNumber} • ${src.sectionPath} • [${src.chunkId}]"
+        view.findViewById<TextView>(R.id.tvCiteScore).text = "Relevance Match: ${"%.1f".format(src.score * 100)}%"
+        view.findViewById<TextView>(R.id.tvCiteExcerpt).text = src.excerpt
+        sheet.setContentView(view)
+        sheet.show()
+    }
+
+    private fun runQueryTurn(query: String, allowExternal: Boolean, existingTurn: ChatTurn?) {
+        val baseUrl = getSharedPreferences("rag_prefs", MODE_PRIVATE).getString("gateway_url", "")?.trimEnd('/') ?: ""
+        if (baseUrl.isEmpty()) {
+            showGatewayUrlDialog()
+            return
+        }
+
+        tvEmptyHint.visibility = View.GONE
+        val turn = existingTurn ?: ChatTurn(
+            id = UUID.randomUUID().toString(),
+            query = query,
+            status = "LOADING",
+            docBody = "Searching your uploaded documents..."
+        ).also {
+            turns.add(it)
+            chatAdapter.notifyItemInserted(turns.size - 1)
+            rvChat.scrollToPosition(turns.size - 1)
+        }
+
+        if (existingTurn != null) {
+            turn.status = "LOADING"
+            turn.usedExternal = true
+            turn.canApproveExternal = false
+            chatAdapter.notifyItemChanged(turns.indexOf(turn))
+        }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val payloadObj = JSONObject()
+                    .put("query", query)
+                    .put("allow_external", allowExternal)
+
+                if (!queryAllDocs && selectedDocIds.isNotEmpty()) {
+                    payloadObj.put("doc_ids", JSONArray(selectedDocIds.toList()))
+                }
+
+                val req = Request.Builder()
+                    .url("$baseUrl/v1/query")
+                    .post(payloadObj.toString().toRequestBody("application/json".toMediaType()))
+                    .build()
+
+                val bodyStr = httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}")
+                    resp.body?.string() ?: "{}"
+                }
+
+                val json = JSONObject(bodyStr)
+                val status = json.optString("status", "INSUFFICIENT_EVIDENCE")
+                val claims = json.optJSONArray("claims")
+                val docSb = StringBuilder()
+
+                if (claims != null && claims.length() > 0) {
+                    for (i in 0 until claims.length()) {
+                        val c = claims.getJSONObject(i)
+                        val cids = c.getJSONArray("citation_ids")
+                        val citeTags = (0 until cids.length()).joinToString(", ") { cids.getString(it) }
+                        docSb.append("• ").append(c.getString("statement")).append(" [$citeTags]\n\n")
+                    }
+                } else {
+                    docSb.append(json.optString("fallback_text", "No verified answer found in your documents."))
+                }
+
+                val sourceItems = mutableListOf<CitationSourceItem>()
+                val srcArr = json.optJSONArray("sources")
+                if (srcArr != null) {
+                    for (i in 0 until srcArr.length()) {
+                        val s = srcArr.getJSONObject(i)
+                        sourceItems.add(
+                            CitationSourceItem(
+                                chunkId = s.getString("chunk_id"),
+                                filename = s.getString("filename"),
+                                pageNumber = s.getInt("page_number"),
+                                sectionPath = s.optString("section_path", "Root"),
+                                score = s.optDouble("rerank_score", 0.0),
+                                excerpt = s.getString("excerpt")
+                            )
+                        )
+                    }
+                }
+
+                val webLinks = mutableListOf<WebSourceItem>()
+                val webArr = json.optJSONArray("web_sources")
+                if (webArr != null) {
+                    for (i in 0 until webArr.length()) {
+                        val ws = webArr.getJSONObject(i)
+                        webLinks.add(WebSourceItem(ws.optString("title"), ws.optString("url")))
+                    }
+                }
+
+                val aiList = mutableListOf<String>()
+                val aiArr = json.optJSONArray("ai_knowledge")
+                if (aiArr != null) {
+                    for (i in 0 until aiArr.length()) {
+                        aiList.add(aiArr.getString(i))
+                    }
+                }
+
+                turn.status = status
+                turn.docBody = docSb.toString().trim()
+                turn.sources = sourceItems
+                turn.canApproveExternal = json.optBoolean("can_approve_external", false)
+                turn.anchorTopic = json.optString("external_anchor_topic", "your documents")
+                turn.webContext = json.optString("web_context", "")
+                turn.webSources = webLinks
+                turn.aiPoints = aiList
+                turn.usedExternal = allowExternal
+
+                withContext(Dispatchers.Main) {
+                    val idx = turns.indexOf(turn)
+                    if (idx >= 0) chatAdapter.notifyItemChanged(idx)
+                    rvChat.scrollToPosition(turns.size - 1)
+                }
+            } catch (e: Exception) {
+                turn.status = "ERROR"
+                turn.docBody = "Could not reach gateway: ${e.message}\n(If Render just woke up, wait 20s and retry.)"
+                withContext(Dispatchers.Main) {
+                    val idx = turns.indexOf(turn)
+                    if (idx >= 0) chatAdapter.notifyItemChanged(idx)
+                }
+            }
+        }
     }
 
     private fun queueDocumentLocally(uri: Uri) {
@@ -114,8 +332,8 @@ class MainActivity : AppCompatActivity() {
 
             withContext(Dispatchers.Main) {
                 enqueueSyncWorker()
-                refreshCorpusStatus()
-                Toast.makeText(this@MainActivity, "Queued $filename", Toast.LENGTH_SHORT).show()
+                refreshVaultPill()
+                Toast.makeText(this@MainActivity, "Added $filename to Vault", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -126,166 +344,19 @@ class MainActivity : AppCompatActivity() {
         WorkManager.getInstance(this).enqueueUniqueWork("rag_doc_sync", ExistingWorkPolicy.REPLACE, req)
     }
 
-    private fun refreshCorpusStatus() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val docs = AppDatabase.getDatabase(this@MainActivity).documentDao().getAllDocuments()
-            val synced = docs.count { it.syncState == "SYNCED" }
-            val queued = docs.count { it.syncState == "QUEUED" }
-            val names = docs.take(3).joinToString(", ") { "${it.filename} (${it.syncState})" }
-            withContext(Dispatchers.Main) {
-                tvCorpusStatus.text = "Corpus: $synced synced | $queued queued" +
-                    if (names.isNotEmpty()) "\nRecent: $names" else ""
-            }
-        }
-    }
-
-    private fun executeQuery(query: String, allowExternal: Boolean) {
-        val baseUrl = getSharedPreferences("rag_prefs", MODE_PRIVATE).getString("gateway_url", "")?.trimEnd('/') ?: ""
-        if (baseUrl.isEmpty()) {
-            showGatewayUrlDialog()
-            return
-        }
-
-        lastQuery = query
-        lastUsedExternal = allowExternal
-        btnApproveExternal.visibility = View.GONE
-        btnSaveAnswer.visibility = View.GONE
-
-        tvStatusBadge.text = if (allowExternal) "FETCHING APPROVED EXTERNAL..." else "STRICT MODE: CHECKING DOCS..."
-        tvStatusBadge.setBackgroundColor(Color.parseColor("#1E293B"))
-        tvAnswerOutput.text = "Searching your uploaded documents..."
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                val payload = JSONObject()
-                    .put("query", query)
-                    .put("allow_external", allowExternal)
-                    .toString()
-
-                val req = Request.Builder()
-                    .url("$baseUrl/v1/query")
-                    .post(payload.toRequestBody("application/json".toMediaType()))
-                    .build()
-
-                val bodyStr = httpClient.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}")
-                    resp.body?.string() ?: "{}"
-                }
-
-                val json = JSONObject(bodyStr)
-                val status = json.optString("status", "INSUFFICIENT_EVIDENCE")
-                val canApprove = json.optBoolean("can_approve_external", false)
-                val anchor = json.optString("external_anchor_topic", "your documents")
-                val topScore = json.optDouble("top_rerank_score", 0.0)
-
-                val ssb = SpannableStringBuilder()
-
-                // LAYER 1: STRICT DOCUMENTS (GREEN)
-                appendColoredHeading(ssb, "[FROM YOUR DOCUMENTS]\n", "#34D399")
-                val claims = json.optJSONArray("claims")
-                if (claims != null && claims.length() > 0) {
-                    for (i in 0 until claims.length()) {
-                        val c = claims.getJSONObject(i)
-                        val cids = c.getJSONArray("citation_ids")
-                        val citeList = (0 until cids.length()).map { cids.getString(it) }
-                        ssb.append("• ").append(c.getString("statement"))
-                            .append("  [").append(citeList.joinToString(", ")).append("]\n\n")
-                    }
-                } else {
-                    ssb.append(json.optString("fallback_text", "No verified match in your documents.")).append("\n\n")
-                }
-
-                // LAYER 2: APPROVED LIVE WEB (BLUE)
-                val webText = json.optString("web_context", "")
-                if (webText.isNotEmpty()) {
-                    appendColoredHeading(ssb, "[APPROVED EXTERNAL • LIVE WEB]\n", "#60A5FA")
-                    ssb.append(webText).append("\n")
-                    val webSources = json.optJSONArray("web_sources")
-                    if (webSources != null && webSources.length() > 0) {
-                        for (i in 0 until webSources.length()) {
-                            val ws = webSources.getJSONObject(i)
-                            ssb.append("  ↗ ${ws.optString("title")}: ${ws.optString("url")}\n")
-                        }
-                    }
-                    ssb.append("\n")
-                }
-
-                // LAYER 3: APPROVED ALIGNED AI KNOWLEDGE (PURPLE)
-                val aiPoints = json.optJSONArray("ai_knowledge")
-                if (aiPoints != null && aiPoints.length() > 0) {
-                    appendColoredHeading(ssb, "[APPROVED EXTERNAL • ALIGNED AI KNOWLEDGE]\n", "#C084FC")
-                    for (i in 0 until aiPoints.length()) {
-                        ssb.append("• ").append(aiPoints.getString(i)).append("\n")
-                    }
-                    ssb.append("\n")
-                }
-
-                // VERIFIED DOCUMENT EXCERPTS
-                val sources = json.optJSONArray("sources")
-                if (sources != null && sources.length() > 0) {
-                    appendColoredHeading(ssb, "--- DOCUMENT EXCERPTS (Top Match: ${"%.2f".format(topScore)}) ---\n", "#94A3B8")
-                    for (i in 0 until sources.length()) {
-                        val s = sources.getJSONObject(i)
-                        ssb.append("[${s.getString("chunk_id")}] ${s.getString("filename")} p.${s.getInt("page_number")}\n")
-                            .append("   \"${s.getString("excerpt").replace("\n", " ")}\"\n\n")
-                    }
-                }
-
-                lastStatus = status
-                lastFormattedText = ssb.toString()
-
-                withContext(Dispatchers.Main) {
-                    tvStatusBadge.text = when {
-                        allowExternal -> "EXTERNAL APPROVED (AUTO-RESETS NEXT QUERY)"
-                        status == "ANSWERED" -> "STRICT MODE: VERIFIED FROM DOCS"
-                        else -> "STRICT MODE: NOT IN DOCUMENTS"
-                    }
-                    tvStatusBadge.setBackgroundColor(
-                        Color.parseColor(
-                            when {
-                                allowExternal -> "#6D28D9"
-                                status == "ANSWERED" -> "#059669"
-                                else -> "#D97706"
-                            }
-                        )
-                    )
-                    tvAnswerOutput.text = ssb
-                    btnSaveAnswer.visibility = View.VISIBLE
-                    if (canApprove) {
-                        btnApproveExternal.text = "Approve Aligned External Lookup ($anchor)"
-                        btnApproveExternal.visibility = View.VISIBLE
-                    }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    tvStatusBadge.text = "ERROR"
-                    tvStatusBadge.setBackgroundColor(Color.parseColor("#DC2626"))
-                    tvAnswerOutput.text = "Query failed: ${e.message}"
-                }
-            }
-        }
-    }
-
-    private fun appendColoredHeading(ssb: SpannableStringBuilder, text: String, hexColor: String) {
-        val start = ssb.length
-        ssb.append(text)
-        ssb.setSpan(ForegroundColorSpan(Color.parseColor(hexColor)), start, ssb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-    }
-
-    private fun saveCurrentAnswerOffline() {
-        if (lastQuery.isEmpty() || lastFormattedText.isEmpty()) return
+    private fun saveTurnOffline(turn: ChatTurn) {
         lifecycleScope.launch(Dispatchers.IO) {
             val rec = SavedAnswerRecord(
-                id = UUID.randomUUID().toString(),
-                queryText = lastQuery,
-                status = lastStatus,
-                usedExternal = lastUsedExternal,
-                formattedBody = lastFormattedText,
+                id = turn.id,
+                queryText = turn.query,
+                status = turn.status,
+                usedExternal = turn.usedExternal,
+                formattedBody = turn.toOfflineSummary(),
                 savedTimestampUtc = System.currentTimeMillis()
             )
             AppDatabase.getDatabase(this@MainActivity).savedAnswerDao().insertAnswer(rec)
             withContext(Dispatchers.Main) {
-                Toast.makeText(this@MainActivity, "Saved offline on device", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, "Saved offline in VeritasVault", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -307,12 +378,11 @@ class MainActivity : AppCompatActivity() {
                     .setTitle("Saved Offline Answers")
                     .setItems(titles) { _, idx ->
                         val picked = items[idx]
-                        etQuery.setText(picked.queryText)
-                        tvStatusBadge.text = "OFFLINE SAVED (${picked.status})"
-                        tvStatusBadge.setBackgroundColor(Color.parseColor("#334155"))
-                        tvAnswerOutput.text = picked.formattedBody
-                        btnApproveExternal.visibility = View.GONE
-                        btnSaveAnswer.visibility = View.GONE
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle(picked.queryText)
+                            .setMessage(picked.formattedBody)
+                            .setPositiveButton("Close", null)
+                            .show()
                     }
                     .setNegativeButton("Close", null)
                     .show()
@@ -323,14 +393,17 @@ class MainActivity : AppCompatActivity() {
     private fun showGatewayUrlDialog() {
         val prefs = getSharedPreferences("rag_prefs", MODE_PRIVATE)
         val input = EditText(this).apply {
-            hint = "https://strictdoc-rag-gateway.onrender.com"
+            hint = "https://veritasvault-gateway.onrender.com"
             setText(prefs.getString("gateway_url", ""))
         }
         AlertDialog.Builder(this)
-            .setTitle("Go RAG Gateway URL")
+            .setTitle("Cloud Gateway URL")
+            .setMessage("Paste your Render HTTPS URL:")
             .setView(input)
-            .setPositiveButton("Save") { _, _ ->
+            .setPositiveButton("Save & Sync") { _, _ ->
                 prefs.edit().putString("gateway_url", input.text.toString().trim()).apply()
+                enqueueSyncWorker()
+                refreshVaultPill()
             }
             .setNegativeButton("Cancel", null)
             .show()

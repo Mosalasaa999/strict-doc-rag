@@ -5,7 +5,9 @@
 
     <application
         android:allowBackup="false"
-        android:label="StrictDoc RAG"
+        android:icon="@drawable/ic_veritas_app_icon"
+        android:roundIcon="@drawable/ic_veritas_app_icon"
+        android:label="VeritasVault"
         android:supportsRtl="true"
         android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
         <activity

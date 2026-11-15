@@ -1,0 +1,23 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Shield Vault Outline -->
+    <path
+        android:fillColor="#0F172A"
+        android:strokeColor="#10B981"
+        android:strokeWidth="3.5"
+        android:pathData="M54,24 L78,33 V53 C78,68 67,79 54,84 C41,79 30,68 30,53 V33 Z" />
+    <!-- Verified V / Check inside Shield -->
+    <path
+        android:strokeColor="#34D399"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M43,52 L51,61 L66,44" />
+    <!-- Accent Dot -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M54,32 m-2.5,0 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>
