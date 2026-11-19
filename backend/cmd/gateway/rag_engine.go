@@ -7,6 +7,7 @@ import (
     "fmt"
     "io"
     "net/http"
+    "sort"
     "strconv"
     "strings"
     "time"
@@ -39,8 +40,8 @@ func formatPgVector(v []float64) string {
 }
 
 func (g *IngestGateway) EmbedText(ctx context.Context, text, taskType string) ([]float64, error) {
-    if g.geminiKey == "" {
-        return nil, fmt.Errorf("GEMINI_API_KEY not set")
+    if len(g.geminiKeys) == 0 {
+        return nil, fmt.Errorf("GEMINI_API_KEYS not set")
     }
     payload := map[string]any{
         "model":                "models/gemini-embedding-001",
@@ -50,28 +51,40 @@ func (g *IngestGateway) EmbedText(ctx context.Context, text, taskType string) ([
     }
     b, _ := json.Marshal(payload)
     url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("x-goog-api-key", g.geminiKey)
 
-    resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
-    if err != nil {
-        return nil, err
+    var lastErr error
+    for attempt := 0; attempt < len(g.geminiKeys); attempt++ {
+        key := g.nextGeminiKey()
+        req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("x-goog-api-key", key)
+
+        resp, err := (&http.Client{Timeout: 25 * time.Second}).Do(req)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        resp.Body.Close()
+
+        if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("gemini embed %d: %s", resp.StatusCode, string(bodyBytes))
+            continue
+        }
+        if resp.StatusCode >= 300 {
+            return nil, fmt.Errorf("gemini embed %d: %s", resp.StatusCode, string(bodyBytes))
+        }
+        var out struct {
+            Embedding struct {
+                Values []float64 `json:"values"`
+            } `json:"embedding"`
+        }
+        if err := json.Unmarshal(bodyBytes, &out); err != nil {
+            return nil, err
+        }
+        return out.Embedding.Values, nil
     }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 {
-        errBody, _ := io.ReadAll(resp.Body)
-        return nil, fmt.Errorf("gemini embed %d: %s", resp.StatusCode, string(errBody))
-    }
-    var out struct {
-        Embedding struct {
-            Values []float64 `json:"values"`
-        } `json:"embedding"`
-    }
-    if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-        return nil, err
-    }
-    return out.Embedding.Values, nil
+    return nil, lastErr
 }
 
 func (g *IngestGateway) ExecuteClosedDomainRAG(ctx context.Context, req QueryRequest) (*QueryResponse, error) {
@@ -135,7 +148,6 @@ func (g *IngestGateway) ExecuteClosedDomainRAG(ctx context.Context, req QueryReq
         }
     }
 
-    // Strict closed-domain document pass
     var docResp *QueryResponse
     if len(topK) == 0 {
         docResp = &QueryResponse{
@@ -165,12 +177,10 @@ func (g *IngestGateway) ExecuteClosedDomainRAG(ctx context.Context, req QueryReq
         }
     }
 
-    // Stop strictly if user has NOT approved external lookup
     if !req.AllowExternal {
         return docResp, nil
     }
 
-    // Approved External Lookup: Web Grounding + Aligned AI Knowledge (kept strictly separate from Document claims)
     anchorText := anchorSummary
     for _, s := range topK {
         anchorText += "\n" + s.Content
@@ -218,19 +228,27 @@ func (g *IngestGateway) fetchCorpusAnchor(ctx context.Context, docIDs []string) 
 }
 
 func (g *IngestGateway) rerankCandidates(ctx context.Context, query string, cands []retrievedCandidate, topN int) ([]retrievedCandidate, float64, error) {
-    if g.cohereKey == "" {
-        return nil, 0, fmt.Errorf("COHERE_API_KEY not set")
+    if g.cohereKey != "" {
+        return g.rerankWithCohere(ctx, query, cands, topN)
     }
+    if len(cands) > 16 {
+        cands = cands[:16]
+    }
+    if len(g.groqKeys) > 0 {
+        res, maxS, err := g.rerankWithGroq(ctx, query, cands, topN)
+        if err == nil {
+            return res, maxS, nil
+        }
+    }
+    return g.rerankWithGemini(ctx, query, cands, topN)
+}
+
+func (g *IngestGateway) rerankWithCohere(ctx context.Context, query string, cands []retrievedCandidate, topN int) ([]retrievedCandidate, float64, error) {
     docs := make([]string, len(cands))
     for i, c := range cands {
         docs[i] = c.Content
     }
-    payload := map[string]any{
-        "model":     g.cohereModel,
-        "query":     query,
-        "documents": docs,
-        "top_n":     topN,
-    }
+    payload := map[string]any{"model": g.cohereModel, "query": query, "documents": docs, "top_n": topN}
     b, _ := json.Marshal(payload)
     req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.cohere.com/v2/rerank", bytes.NewReader(b))
     req.Header.Set("Authorization", "Bearer "+g.cohereKey)
@@ -269,6 +287,140 @@ func (g *IngestGateway) rerankCandidates(ctx context.Context, query string, cand
         }
     }
     return reranked, maxScore, nil
+}
+
+func (g *IngestGateway) rerankWithGroq(ctx context.Context, query string, cands []retrievedCandidate, topN int) ([]retrievedCandidate, float64, error) {
+    var sb strings.Builder
+    for i, c := range cands {
+        snippet := c.Content
+        if len(snippet) > 650 {
+            snippet = snippet[:650]
+        }
+        sb.WriteString(fmt.Sprintf("[%d] %s\n---\n", i, snippet))
+    }
+
+    prompt := fmt.Sprintf(
+        "Score how directly each passage contains facts answering the QUERY (0.00 = unrelated, 1.00 = exact direct answer).\nReturn strict JSON: {\"scores\": [{\"index\": 0, \"score\": 0.85}]}\n\nQUERY: %s\n\nPASSAGES:\n%s",
+        query, sb.String(),
+    )
+
+    payload := map[string]any{
+        "model":           g.groqModel,
+        "temperature":     0.0,
+        "response_format": map[string]string{"type": "json_object"},
+        "messages": []map[string]string{
+            {"role": "system", "content": "You are a strict relevance scoring engine. Output only JSON."},
+            {"role": "user", "content": prompt},
+        },
+    }
+    b, _ := json.Marshal(payload)
+
+    var lastErr error
+    for attempt := 0; attempt < len(g.groqKeys); attempt++ {
+        key := g.nextGroqKey()
+        req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(b))
+        req.Header.Set("Authorization", "Bearer "+key)
+        req.Header.Set("Content-Type", "application/json")
+
+        resp, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        resp.Body.Close()
+
+        if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("groq %d: %s", resp.StatusCode, string(bodyBytes))
+            continue
+        }
+        if resp.StatusCode >= 300 {
+            return nil, 0, fmt.Errorf("groq %d: %s", resp.StatusCode, string(bodyBytes))
+        }
+
+        var groqOut struct {
+            Choices []struct {
+                Message struct {
+                    Content string `json:"content"`
+                } `json:"message"`
+            } `json:"choices"`
+        }
+        if err := json.Unmarshal(bodyBytes, &groqOut); err != nil || len(groqOut.Choices) == 0 {
+            return nil, 0, fmt.Errorf("invalid groq json")
+        }
+        return parseScoredCandidates(groqOut.Choices[0].Message.Content, cands, topN)
+    }
+    return nil, 0, lastErr
+}
+
+func (g *IngestGateway) rerankWithGemini(ctx context.Context, query string, cands []retrievedCandidate, topN int) ([]retrievedCandidate, float64, error) {
+    var sb strings.Builder
+    for i, c := range cands {
+        snippet := c.Content
+        if len(snippet) > 650 {
+            snippet = snippet[:650]
+        }
+        sb.WriteString(fmt.Sprintf("[%d] %s\n---\n", i, snippet))
+    }
+    prompt := fmt.Sprintf("Score each passage 0.0-1.0 for directly answering the query.\nQUERY: %s\nPASSAGES:\n%s", query, sb.String())
+    payload := map[string]any{
+        "contents": []map[string]any{{"role": "user", "parts": []map[string]string{{"text": prompt}}}},
+        "generationConfig": map[string]any{
+            "temperature":      0.0,
+            "responseMimeType": "application/json",
+            "responseSchema": map[string]any{
+                "type": "OBJECT",
+                "properties": map[string]any{
+                    "scores": map[string]any{
+                        "type": "ARRAY",
+                        "items": map[string]any{
+                            "type": "OBJECT",
+                            "properties": map[string]any{
+                                "index": map[string]any{"type": "INTEGER"},
+                                "score": map[string]any{"type": "NUMBER"},
+                            },
+                            "required": []string{"index", "score"},
+                        },
+                    },
+                },
+                "required": []string{"scores"},
+            },
+        },
+    }
+    raw, err := g.callGeminiRaw(ctx, payload)
+    if err != nil {
+        return nil, 0, err
+    }
+    return parseScoredCandidates(raw, cands, topN)
+}
+
+func parseScoredCandidates(rawJSON string, cands []retrievedCandidate, topN int) ([]retrievedCandidate, float64, error) {
+    var parsed struct {
+        Scores []struct {
+            Index int     `json:"index"`
+            Score float64 `json:"score"`
+        } `json:"scores"`
+    }
+    if err := json.Unmarshal([]byte(rawJSON), &parsed); err != nil {
+        return nil, 0, err
+    }
+    scored := make([]retrievedCandidate, 0, len(parsed.Scores))
+    for _, s := range parsed.Scores {
+        if s.Index >= 0 && s.Index < len(cands) {
+            c := cands[s.Index]
+            c.RerankScore = s.Score
+            scored = append(scored, c)
+        }
+    }
+    sort.Slice(scored, func(i, j int) bool { return scored[i].RerankScore > scored[j].RerankScore })
+    if len(scored) > topN {
+        scored = scored[:topN]
+    }
+    maxScore := 0.0
+    if len(scored) > 0 {
+        maxScore = scored[0].RerankScore
+    }
+    return scored, maxScore, nil
 }
 
 func (g *IngestGateway) generateGroundedJSON(ctx context.Context, query string, sources []retrievedCandidate, topScore float64, anchor string, canApprove bool) (*QueryResponse, error) {
@@ -363,8 +515,10 @@ RULES:
     }, nil
 }
 
-// Separate Prose Call for Live Web Grounding (prevents Gemini JSON+Search suppression bug)
 func (g *IngestGateway) fetchAlignedWebContext(ctx context.Context, query, anchor string) (string, []WebSource, error) {
+    if len(g.geminiKeys) == 0 {
+        return "", nil, fmt.Errorf("GEMINI_API_KEYS not set")
+    }
     prompt := fmt.Sprintf(
         "Using Google Search, find up-to-date external facts that directly answer or clarify the user's question, STRICTLY aligned and relative to the scope of these source documents:\n<document_anchor>\n%s\n</document_anchor>\n\nUSER QUESTION: %s\nKeep it concise (3-5 bullet points). Do not drift off-topic.",
         anchor, query,
@@ -377,54 +531,62 @@ func (g *IngestGateway) fetchAlignedWebContext(ctx context.Context, query, ancho
 
     b, _ := json.Marshal(payload)
     url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", g.geminiModel)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("x-goog-api-key", g.geminiKey)
 
-    resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-    if err != nil {
-        return "", nil, err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 {
-        return "", nil, fmt.Errorf("web search status %d", resp.StatusCode)
-    }
+    for attempt := 0; attempt < len(g.geminiKeys); attempt++ {
+        key := g.nextGeminiKey()
+        req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("x-goog-api-key", key)
 
-    var out struct {
-        Candidates []struct {
-            Content struct {
-                Parts []struct {
-                    Text string `json:"text"`
-                } `json:"parts"`
-            } `json:"content"`
-            GroundingMetadata struct {
-                GroundingChunks []struct {
-                    Web struct {
-                        URI   string `json:"uri"`
-                        Title string `json:"title"`
-                    } `json:"web"`
-                } `json:"groundingChunks"`
-            } `json:"groundingMetadata"`
-        } `json:"candidates"`
-    }
-    if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Candidates) == 0 {
-        return "", nil, err
-    }
-
-    var text strings.Builder
-    for _, p := range out.Candidates[0].Content.Parts {
-        text.WriteString(p.Text)
-    }
-    var srcs []WebSource
-    for _, ch := range out.Candidates[0].GroundingMetadata.GroundingChunks {
-        if ch.Web.URI != "" {
-            srcs = append(srcs, WebSource{Title: ch.Web.Title, URL: ch.Web.URI})
+        resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+        if err != nil {
+            continue
         }
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        resp.Body.Close()
+        if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+            continue
+        }
+        if resp.StatusCode >= 300 {
+            return "", nil, fmt.Errorf("web search status %d", resp.StatusCode)
+        }
+
+        var out struct {
+            Candidates []struct {
+                Content struct {
+                    Parts []struct {
+                        Text string `json:"text"`
+                    } `json:"parts"`
+                } `json:"content"`
+                GroundingMetadata struct {
+                    GroundingChunks []struct {
+                        Web struct {
+                            URI   string `json:"uri"`
+                            Title string `json:"title"`
+                        } `json:"web"`
+                    } `json:"groundingChunks"`
+                } `json:"groundingMetadata"`
+            } `json:"candidates"`
+        }
+        if err := json.Unmarshal(bodyBytes, &out); err != nil || len(out.Candidates) == 0 {
+            return "", nil, err
+        }
+
+        var text strings.Builder
+        for _, p := range out.Candidates[0].Content.Parts {
+            text.WriteString(p.Text)
+        }
+        var srcs []WebSource
+        for _, ch := range out.Candidates[0].GroundingMetadata.GroundingChunks {
+            if ch.Web.URI != "" {
+                srcs = append(srcs, WebSource{Title: ch.Web.Title, URL: ch.Web.URI})
+            }
+        }
+        return strings.TrimSpace(text.String()), srcs, nil
     }
-    return strings.TrimSpace(text.String()), srcs, nil
+    return "", nil, fmt.Errorf("gemini web search exhausted pool")
 }
 
-// Separate Structured Call for Aligned Parametric AI Knowledge
 func (g *IngestGateway) fetchAlignedAIKnowledge(ctx context.Context, query, anchor string) ([]string, error) {
     prompt := fmt.Sprintf(
         "Provide concise external background knowledge from your training that is STRICTLY aligned and relative to the user's uploaded document context below:\n<document_anchor>\n%s\n</document_anchor>\n\nUSER QUESTION: %s\nReturn 2-4 crisp factual points explaining relevant concepts not explicitly covered in the document.",
@@ -459,38 +621,53 @@ func (g *IngestGateway) fetchAlignedAIKnowledge(ctx context.Context, query, anch
 }
 
 func (g *IngestGateway) callGeminiRaw(ctx context.Context, payload map[string]any) (string, error) {
+    if len(g.geminiKeys) == 0 {
+        return "", fmt.Errorf("GEMINI_API_KEYS not set")
+    }
     b, _ := json.Marshal(payload)
     url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent", g.geminiModel)
-    req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
-    req.Header.Set("Content-Type", "application/json")
-    req.Header.Set("x-goog-api-key", g.geminiKey)
 
-    resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-    if err != nil {
-        return "", err
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode >= 300 {
-        errBody, _ := io.ReadAll(resp.Body)
-        return "", fmt.Errorf("gemini %d: %s", resp.StatusCode, string(errBody))
-    }
+    var lastErr error
+    for attempt := 0; attempt < len(g.geminiKeys); attempt++ {
+        key := g.nextGeminiKey()
+        req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("x-goog-api-key", key)
 
-    var apiOut struct {
-        Candidates []struct {
-            Content struct {
-                Parts []struct {
-                    Text string `json:"text"`
-                } `json:"parts"`
-            } `json:"content"`
-        } `json:"candidates"`
+        resp, err := (&http.Client{Timeout: 45 * time.Second}).Do(req)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        resp.Body.Close()
+
+        if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("gemini %d: %s", resp.StatusCode, string(bodyBytes))
+            continue
+        }
+        if resp.StatusCode >= 300 {
+            return "", fmt.Errorf("gemini %d: %s", resp.StatusCode, string(bodyBytes))
+        }
+
+        var apiOut struct {
+            Candidates []struct {
+                Content struct {
+                    Parts []struct {
+                        Text string `json:"text"`
+                    } `json:"parts"`
+                } `json:"content"`
+            } `json:"candidates"`
+        }
+        if err := json.Unmarshal(bodyBytes, &apiOut); err != nil {
+            return "", err
+        }
+        if len(apiOut.Candidates) == 0 || len(apiOut.Candidates[0].Content.Parts) == 0 {
+            return "", fmt.Errorf("empty gemini response")
+        }
+        return apiOut.Candidates[0].Content.Parts[0].Text, nil
     }
-    if err := json.NewDecoder(resp.Body).Decode(&apiOut); err != nil {
-        return "", err
-    }
-    if len(apiOut.Candidates) == 0 || len(apiOut.Candidates[0].Content.Parts) == 0 {
-        return "", fmt.Errorf("empty gemini response")
-    }
-    return apiOut.Candidates[0].Content.Parts[0].Text, nil
+    return "", lastErr
 }
 
 func toCitationSources(in []retrievedCandidate) []CitationSource {

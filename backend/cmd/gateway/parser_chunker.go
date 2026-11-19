@@ -3,6 +3,7 @@ package main
 import (
     "bytes"
     "context"
+    "encoding/base64"
     "encoding/json"
     "fmt"
     "io"
@@ -24,14 +25,61 @@ type StructuredChunk struct {
     Content     string
 }
 
+// ParseDocument uses LlamaParse if LLAMA_CLOUD_API_KEY is set, otherwise uses
+// native Gemini multimodal layout extraction (zero extra keys needed for PDFs).
 func (g *IngestGateway) ParseDocument(ctx context.Context, filename, ext string, data []byte) ([]ParsedPage, error) {
     if ext == ".txt" || ext == ".md" {
         return []ParsedPage{{PageNumber: 1, Markdown: string(data)}}, nil
     }
-    if g.llamaKey == "" {
-        return nil, fmt.Errorf("LLAMA_CLOUD_API_KEY required for %s layout parsing", ext)
+    if g.llamaKey != "" {
+        return g.parseWithLlamaParse(ctx, filename, data)
+    }
+    return g.parsePDFWithGemini(ctx, ext, data)
+}
+
+func (g *IngestGateway) parsePDFWithGemini(ctx context.Context, ext string, data []byte) ([]ParsedPage, error) {
+    if ext != ".pdf" {
+        return nil, fmt.Errorf("unsupported file type %s without LLAMA_CLOUD_API_KEY (use PDF, MD, or TXT)", ext)
+    }
+    b64 := base64.StdEncoding.EncodeToString(data)
+    prompt := `Extract ALL text and tables verbatim from this PDF in exact reading order as clean Markdown.
+Rules:
+1. Separate each PDF page with a line containing ONLY: ---
+2. Preserve headings using #, ##, ###.
+3. Preserve every table as a clean Markdown pipe table (| col | col |).
+4. Do NOT summarize, omit clauses, or add commentary. Output ONLY the extracted Markdown.`
+
+    payload := map[string]any{
+        "contents": []map[string]any{{
+            "role": "user",
+            "parts": []map[string]any{
+                {"inlineData": map[string]string{"mimeType": "application/pdf", "data": b64}},
+                {"text": prompt},
+            },
+        }},
+        "generationConfig": map[string]any{"temperature": 0.0},
     }
 
+    md, err := g.callGeminiRaw(ctx, payload)
+    if err != nil {
+        return nil, err
+    }
+
+    rawPages := strings.Split(md, "\n---\n")
+    pages := make([]ParsedPage, 0, len(rawPages))
+    for idx, p := range rawPages {
+        trimmed := strings.TrimSpace(p)
+        if trimmed != "" {
+            pages = append(pages, ParsedPage{PageNumber: idx + 1, Markdown: trimmed})
+        }
+    }
+    if len(pages) == 0 && strings.TrimSpace(md) != "" {
+        pages = append(pages, ParsedPage{PageNumber: 1, Markdown: strings.TrimSpace(md)})
+    }
+    return pages, nil
+}
+
+func (g *IngestGateway) parseWithLlamaParse(ctx context.Context, filename string, data []byte) ([]ParsedPage, error) {
     var body bytes.Buffer
     writer := multipart.NewWriter(&body)
     part, err := writer.CreateFormFile("file", filename)

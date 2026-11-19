@@ -1,14 +1,16 @@
 services:
   - type: web
-    name: strictdoc-rag-gateway
+    name: veritasvault-gateway
     runtime: docker
     plan: free
     envVars:
       - key: DATABASE_URL
         sync: false
-      - key: LLAMA_CLOUD_API_KEY
+      - key: GEMINI_API_KEYS
         sync: false
-      - key: GEMINI_API_KEY
+      - key: GROQ_API_KEYS
+        sync: false
+      - key: LLAMA_CLOUD_API_KEY
         sync: false
       - key: COHERE_API_KEY
         sync: false

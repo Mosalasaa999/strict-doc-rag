@@ -13,6 +13,7 @@ import (
     "os"
     "path/filepath"
     "strings"
+    "sync"
     "time"
 
     _ "github.com/lib/pq"
@@ -21,11 +22,16 @@ import (
 type IngestGateway struct {
     db              *sql.DB
     llamaKey        string
-    geminiKey       string
+    geminiKeys      []string
+    groqKeys        []string
     cohereKey       string
     geminiModel     string
+    groqModel       string
     cohereModel     string
     rerankThreshold float64
+    keyMu           sync.Mutex
+    geminiIdx       int
+    groqIdx         int
 }
 
 type QueryRequest struct {
@@ -55,7 +61,7 @@ type WebSource struct {
 }
 
 type QueryResponse struct {
-    Status              string           `json:"status"` // "ANSWERED" | "INSUFFICIENT_EVIDENCE" | "EXTERNAL_ENRICHED"
+    Status              string           `json:"status"`
     Claims              []Claim          `json:"claims"`
     FallbackText        string           `json:"fallback_text,omitempty"`
     Sources             []CitationSource `json:"sources"`
@@ -76,6 +82,44 @@ type DocumentSummary struct {
 }
 
 const DeterministicFallback = "INSUFFICIENT_EVIDENCE: Your uploaded documents do not contain enough verified information to answer this query."
+
+func splitKeyPool(envNames ...string) []string {
+    var keys []string
+    seen := map[string]bool{}
+    for _, name := range envNames {
+        raw := os.Getenv(name)
+        for _, part := range strings.Split(raw, ",") {
+            k := strings.TrimSpace(part)
+            if k != "" && !seen[k] {
+                seen[k] = true
+                keys = append(keys, k)
+            }
+        }
+    }
+    return keys
+}
+
+func (g *IngestGateway) nextGeminiKey() string {
+    g.keyMu.Lock()
+    defer g.keyMu.Unlock()
+    if len(g.geminiKeys) == 0 {
+        return ""
+    }
+    k := g.geminiKeys[g.geminiIdx%len(g.geminiKeys)]
+    g.geminiIdx++
+    return k
+}
+
+func (g *IngestGateway) nextGroqKey() string {
+    g.keyMu.Lock()
+    defer g.keyMu.Unlock()
+    if len(g.groqKeys) == 0 {
+        return ""
+    }
+    k := g.groqKeys[g.groqIdx%len(g.groqKeys)]
+    g.groqIdx++
+    return k
+}
 
 func initDB(db *sql.DB) error {
     ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -194,7 +238,7 @@ func (g *IngestGateway) HandleDocuments(w http.ResponseWriter, r *http.Request) 
             vec, err := g.EmbedText(r.Context(), ch.Content, "RETRIEVAL_DOCUMENT")
             if err != nil {
                 log.Printf("[ERR] Embedding chunk %s: %v", ch.ChunkID, err)
-                http.Error(w, `{"error":"embedding API failure"}`, http.StatusBadGateway)
+                http.Error(w, fmt.Sprintf(`{"error":"embedding API failure: %v"}`, err), http.StatusBadGateway)
                 return
             }
             embeddings[i] = formatPgVector(vec)
@@ -271,7 +315,7 @@ func (g *IngestGateway) HandleQuery(w http.ResponseWriter, r *http.Request) {
     resp, err := g.ExecuteClosedDomainRAG(r.Context(), req)
     if err != nil {
         log.Printf("[ERR] RAG pipeline error: %v", err)
-        http.Error(w, `{"error":"rag pipeline failure"}`, http.StatusBadGateway)
+        http.Error(w, fmt.Sprintf(`{"error":"rag pipeline failure: %v"}`, err), http.StatusBadGateway)
         return
     }
     json.NewEncoder(w).Encode(resp)
@@ -302,32 +346,43 @@ func main() {
     if geminiModel == "" {
         geminiModel = "gemini-2.5-flash"
     }
+    groqModel := os.Getenv("GROQ_MODEL")
+    if groqModel == "" {
+        groqModel = "llama-3.3-70b-versatile"
+    }
     cohereModel := os.Getenv("COHERE_RERANK_MODEL")
     if cohereModel == "" {
         cohereModel = "rerank-v5.0-fast"
     }
 
+    geminiPool := splitKeyPool("GEMINI_API_KEYS", "GEMINI_API_KEY")
+    groqPool := splitKeyPool("GROQ_API_KEYS", "GROQ_API_KEY")
+
     gateway := &IngestGateway{
         db:              db,
         llamaKey:        os.Getenv("LLAMA_CLOUD_API_KEY"),
-        geminiKey:       os.Getenv("GEMINI_API_KEY"),
+        geminiKeys:      geminiPool,
+        groqKeys:        groqPool,
         cohereKey:       os.Getenv("COHERE_API_KEY"),
         geminiModel:     geminiModel,
+        groqModel:       groqModel,
         cohereModel:     cohereModel,
         rerankThreshold: 0.35,
     }
 
     http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]string{
-            "status":  "ONLINE",
-            "system":  "StrictDoc Closed-Domain RAG API",
-            "version": "1.0.0",
+        json.NewEncoder(w).Encode(map[string]any{
+            "status":      "ONLINE",
+            "system":      "VeritasVault Closed-Domain RAG API",
+            "version":     "1.1.0",
+            "gemini_pool": len(geminiPool),
+            "groq_pool":   len(groqPool),
         })
     })
     http.HandleFunc("/v1/documents", gateway.HandleDocuments)
     http.HandleFunc("/v1/query", gateway.HandleQuery)
 
-    log.Printf("[BOOT] StrictDoc RAG Gateway listening on :%s", port)
+    log.Printf("[BOOT] VeritasVault Gateway listening on :%s (Gemini keys: %d, Groq keys: %d)", port, len(geminiPool), len(groqPool))
     log.Fatal(http.ListenAndServe(":"+port, nil))
 }
